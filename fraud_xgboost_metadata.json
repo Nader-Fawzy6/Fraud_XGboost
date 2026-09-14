@@ -1,0 +1,10 @@
+{
+  "threshold": 0.6564267873764038,
+  "scale_pos_weight": 818.672131147541,
+  "target_mapping": {
+    "No": 0,
+    "Yes": 1
+  },
+  "rare_merchant_threshold": 5,
+  "random_state": 42
+}
