@@ -1,26 +1,30 @@
 """
 Fraud Detection Dashboard — for non-technical stakeholders
 ============================================================
-Run with:
-    streamlit run app.py
-
-Expects two files in the same folder (produced by the training notebook):
+Built against the actual trained pipeline:
     fraud_xgboost_pipeline.joblib
     fraud_xgboost_metadata.json
 
-If these files are not found, the dashboard still runs in DEMO MODE
-with a clearly-labeled illustrative scorer, so the UI can be reviewed
-even without the trained model.
+Run with:
+    streamlit run app.py
+
+IMPORTANT: the custom transformer classes below (FraudFeatureEngineer,
+MerchantFrequencyEncoder) MUST be defined in this file, with the exact
+same names and logic used during training, or joblib.load() will fail
+to deserialize the pipeline.
 """
 
 from pathlib import Path
 import json
+import sys
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+
+from sklearn.base import BaseEstimator, TransformerMixin
 
 # ------------------------------------------------------------------
 # Page configuration
@@ -34,10 +38,137 @@ st.set_page_config(
 MODEL_PATH = Path("fraud_xgboost_pipeline.joblib")
 METADATA_PATH = Path("fraud_xgboost_metadata.json")
 
+
+# ====================================================================
+# EXACT custom transformer definitions used during training.
+# These must match the training notebook precisely.
+# ====================================================================
+US_STATES_AND_TERRITORIES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+    "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+    "VA","WA","WV","WI","WY","DC","AA","AE","AP",
+}
+
+
+class FraudFeatureEngineer(BaseEstimator, TransformerMixin):
+    """Stateless feature engineering for one transaction per row."""
+
+    def fit(self, X, y=None):
+        return self
+
+    @staticmethod
+    def _money_to_float(series):
+        if pd.api.types.is_numeric_dtype(series):
+            return pd.to_numeric(series, errors="coerce")
+        return pd.to_numeric(
+            series.astype("string")
+                  .str.replace("$", "", regex=False)
+                  .str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+
+    def transform(self, X):
+        X = X.copy()
+
+        money_cols = ["Amount", "Credit Limit", "Yearly Income - Person",
+                      "Total Debt", "Per Capita Income - Zipcode"]
+        for col in money_cols:
+            if col in X.columns:
+                X[col] = self._money_to_float(X[col])
+
+        dt = pd.to_datetime(
+            X["Year"].astype("Int64").astype(str) + "-" +
+            X["Month"].astype("Int64").astype(str) + "-" +
+            X["Day"].astype("Int64").astype(str) + " " +
+            X["Time"].astype(str),
+            errors="coerce",
+        )
+
+        X["hour"] = dt.dt.hour
+        X["day_of_week"] = dt.dt.dayofweek
+        X["is_weekend"] = X["day_of_week"].isin([5, 6]).astype("int8")
+        X["month"] = dt.dt.month
+        X["day_of_month"] = dt.dt.day
+        X["hour_sin"] = np.sin(2 * np.pi * X["hour"] / 24)
+        X["hour_cos"] = np.cos(2 * np.pi * X["hour"] / 24)
+        X["month_sin"] = np.sin(2 * np.pi * X["month"] / 12)
+        X["month_cos"] = np.cos(2 * np.pi * X["month"] / 12)
+
+        errors = X["Errors?"].fillna("").astype(str)
+        error_patterns = {
+            "bad_pin": "Bad PIN", "insufficient_balance": "Insufficient Balance",
+            "technical_glitch": "Technical Glitch", "bad_card_number": "Bad Card Number",
+            "bad_cvv": "Bad CVV", "bad_expiration": "Bad Expiration", "bad_zipcode": "Bad Zipcode",
+        }
+        X["has_error"] = errors.ne("").astype("int8")
+        for new_col, pattern in error_patterns.items():
+            X[new_col] = errors.str.contains(pattern, regex=False, na=False).astype("int8")
+        error_cols = list(error_patterns)
+        X["error_count"] = X[error_cols].sum(axis=1)
+
+        X["is_international"] = (
+            X["Merchant State"].notna() & ~X["Merchant State"].isin(US_STATES_AND_TERRITORIES)
+        ).astype("int8")
+        X["same_state"] = X["Merchant State"].eq(X["State"]).astype("int8")
+        X["same_city"] = X["Merchant City"].eq(X["City"]).astype("int8")
+
+        merchant_zip = X["Zip"].astype("string").str.replace(r"\.0$", "", regex=True)
+        home_zip = X["Zipcode"].astype("string").str.replace(r"\.0$", "", regex=True)
+        X["same_zip"] = merchant_zip.eq(home_zip).fillna(False).astype("int8")
+
+        X["is_online"] = X["Use Chip"].eq("Online Transaction").astype("int8")
+
+        acct_open = pd.to_datetime(X["Acct Open Date"], format="%m/%Y", errors="coerce")
+        expires = pd.to_datetime(X["Expires"], format="%m/%Y", errors="coerce")
+        X["account_age_days"] = (dt - acct_open).dt.days
+        X["months_until_expiry"] = (expires.dt.year - dt.dt.year) * 12 + (expires.dt.month - dt.dt.month)
+
+        drop_cols = [
+            "User", "Card", "Merchant State", "Merchant City", "City", "State",
+            "Year", "Month", "Day", "Time", "Expires", "Acct Open Date",
+            "Year PIN last Changed", "Zip", "Zipcode", "Errors?",
+        ]
+        return X.drop(columns=drop_cols, errors="ignore")
+
+
+class MerchantFrequencyEncoder(BaseEstimator, TransformerMixin):
+    """Learn merchant counts only from the training rows seen by fit()."""
+
+    def __init__(self, rare_threshold=5):
+        self.rare_threshold = rare_threshold
+
+    def fit(self, X, y=None):
+        X = X.copy()
+        self.freq_map_ = X["Merchant Name"].value_counts(dropna=False)
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        freq = X["Merchant Name"].map(self.freq_map_).fillna(0)
+        X["merchant_frequency"] = freq.astype("float32")
+        X["is_rare_merchant"] = (freq <= self.rare_threshold).astype("int8")
+        return X.drop(columns=["Merchant Name"])
+
+
 # ------------------------------------------------------------------
-# Final, reported evaluation results (from the project's test-set run).
-# These are fixed historical numbers used only for the Overview page;
-# they are NOT recomputed live.
+# IMPORTANT FOR STREAMLIT CLOUD / JOBLIB DESERIALIZATION
+# ------------------------------------------------------------------
+# The pipeline was trained/saved from a notebook, so these custom
+# transformers were pickled as belonging to the module "__main__".
+# Streamlit executes app.py through its own runner, where sys.modules
+# ["__main__"] is not necessarily this script's namespace. Register
+# the classes explicitly so joblib/pickle can resolve the original
+# references stored inside fraud_xgboost_pipeline.joblib.
+_main_module = sys.modules.get("__main__")
+if _main_module is not None:
+    setattr(_main_module, "FraudFeatureEngineer", FraudFeatureEngineer)
+    setattr(_main_module, "MerchantFrequencyEncoder", MerchantFrequencyEncoder)
+
+
+# ------------------------------------------------------------------
+# Fixed, historical evaluation numbers for the Overview page
+# (adjust these if you re-train and get new final test-set numbers).
 # ------------------------------------------------------------------
 REPORTED_RESULTS = {
     "precision": 0.9189,
@@ -45,41 +176,47 @@ REPORTED_RESULTS = {
     "f1": 0.7454,
     "pr_auc": 0.7587,
     "roc_auc": 0.9896,
-    "threshold": 0.634,
     "confusion_matrix": np.array([[399485, 27], [182, 306]]),
     "fraud_rate_real_world": 0.00122,
 }
 
 TOP_FEATURES_STORY = [
-    ("Different state from home address", "same_state"),
-    ("Merchant category (e.g. money transfer, travel)", "MCC"),
-    ("Different city from home address", "same_city"),
-    ("Rarely-used merchant", "is_rare_merchant"),
-    ("How often this merchant is used overall", "merchant_frequency"),
-    ("Different ZIP code from home address", "same_zip"),
-    ("Transaction made outside the home country", "is_international"),
+    "Whether the merchant's ZIP code matches the cardholder's home ZIP code",
+    "Whether the merchant's city matches the cardholder's home city",
+    "Whether the merchant's state matches the cardholder's home state",
+    "The merchant's category (e.g. money transfer, travel, cash-like services)",
+    "Whether this is a rarely-used / newly-seen merchant",
+    "Whether the transaction happened outside the home country",
 ]
 
+# Curated, human-readable subset of the 109 MCC codes actually seen in training
 MCC_CHOICES = {
     "Grocery Store / Supermarket": 5411,
+    "Miscellaneous Food Store": 5499,
     "Gas Station": 5541,
     "Restaurant": 5812,
+    "Fast Food Restaurant": 5814,
     "Drug Store / Pharmacy": 5912,
     "Money Transfer Service": 4829,
+    "Utilities": 4900,
+    "Telecom Services": 4814,
+    "Cable / Other Pay TV": 4899,
     "Airline": 3000,
     "Cruise Line": 4411,
+    "Car Rental": 3389,
+    "Hotel / Lodging": 3504,
     "Electronics Store": 5732,
     "Department Store": 5311,
-    "Online / Digital Goods": 5968,
+    "Discount Store": 5310,
+    "Book Store": 5942,
+    "Digital Goods / Software": 5045,
+    "Government Services": 9402,
+    "Wire Transfer / Financial Institution": 6300,
+    "Other (Miscellaneous)": 7995,
 }
 
-US_STATES = [
-    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
-    "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
-    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
-    "VA","WA","WV","WI","WY","DC",
-]
-FOREIGN_COUNTRIES = ["Nigeria", "Russia", "China", "Romania", "Vietnam", "Ukraine", "Brazil"]
+US_STATES = sorted([s for s in US_STATES_AND_TERRITORIES if s not in {"AA", "AE", "AP"}])
+FOREIGN_COUNTRIES = ["Nigeria", "Russia", "China", "Romania", "Vietnam", "Ukraine", "Brazil", "Canada"]
 
 ERROR_OPTIONS = [
     "Bad PIN", "Insufficient Balance", "Technical Glitch",
@@ -107,32 +244,31 @@ threshold = metadata.get("threshold", 0.5)
 # ------------------------------------------------------------------
 # Demo-mode fallback scorer (used only if no trained model is found)
 # ------------------------------------------------------------------
-def demo_mode_score(row: dict) -> float:
-    """A simple, clearly-illustrative rule-based score — NOT the real model."""
+def demo_mode_score(same_state, same_city, same_zip, is_intl, is_rare, amount, has_errors):
     score = 0.02
-    if row["_same_state"] == "No":
-        score += 0.35
-    if row["_same_city"] == "No":
+    if same_zip == 0:
+        score += 0.20
+    if same_city == 0:
         score += 0.15
-    if row["_is_international"]:
-        score += 0.35
-    if row["_is_rare_merchant"]:
+    if same_state == 0:
         score += 0.10
-    if row["Amount"] > 800:
+    if is_intl:
         score += 0.05
-    if row["Errors?"]:
+    if is_rare:
+        score += 0.10
+    if amount > 800:
+        score += 0.05
+    if has_errors:
         score += 0.05
     return float(min(score, 0.99))
 
 
 # ------------------------------------------------------------------
 # Build a single raw transaction row matching the pipeline's expected
-# input schema (same columns as X before feature engineering).
+# input schema — exactly the raw merged columns, before any
+# feature engineering (the pipeline does all of that internally).
 # ------------------------------------------------------------------
 def build_transaction_row(inputs: dict) -> pd.DataFrame:
-    merchant_state = inputs["merchant_state"]
-    home_state = inputs["home_state"]
-
     row = {
         "User": 0,
         "Card": 0,
@@ -144,7 +280,7 @@ def build_transaction_row(inputs: dict) -> pd.DataFrame:
         "Use Chip": inputs["use_chip"],
         "Merchant Name": inputs["merchant_name"],
         "Merchant City": inputs["merchant_city"],
-        "Merchant State": merchant_state,
+        "Merchant State": inputs["merchant_state"],
         "Zip": inputs["merchant_zip"],
         "MCC": inputs["mcc"],
         "Errors?": ",".join(inputs["errors"]) if inputs["errors"] else np.nan,
@@ -152,7 +288,7 @@ def build_transaction_row(inputs: dict) -> pd.DataFrame:
         "Retirement Age": inputs["retirement_age"],
         "Gender": inputs["gender"],
         "City": inputs["home_city"],
-        "State": home_state,
+        "State": inputs["home_state"],
         "Zipcode": inputs["home_zip"],
         "Per Capita Income - Zipcode": inputs["per_capita_income"],
         "Yearly Income - Person": inputs["yearly_income"],
@@ -187,7 +323,7 @@ if not MODEL_LOADED:
         f"Expected: `{MODEL_PATH.name}` and `{METADATA_PATH.name}`"
     )
 else:
-    st.sidebar.success("✅ Trained model loaded successfully.")
+    st.sidebar.success(f"✅ Model loaded — decision threshold: {threshold*100:.1f}%")
 
 
 # ====================================================================
@@ -210,15 +346,13 @@ if page == "Overview":
                 help="Fraud cases the system did not catch, out of 400,000 tested")
 
     st.markdown("---")
-
     left, right = st.columns([1.1, 1])
 
     with left:
         st.subheader("What this means in plain terms")
         st.markdown(
             f"""
-- Out of every **100 fraud alerts** the system raises, about **{REPORTED_RESULTS['precision']*100:.0f} are genuine fraud** —
-  the review team is rarely sent on a wild goose chase.
+- Out of every **100 fraud alerts** the system raises, about **{REPORTED_RESULTS['precision']*100:.0f} are genuine fraud**.
 - The system successfully catches about **{REPORTED_RESULTS['recall']*100:.0f} out of every 100** real fraud cases.
 - Only **{REPORTED_RESULTS['confusion_matrix'][0,1]} legitimate customers** out of 399,512 tested were
   ever incorrectly flagged — a false-alarm rate of **0.007%**.
@@ -227,15 +361,14 @@ if page == "Overview":
         st.info(
             "The real-world fraud rate is extremely low — only about "
             f"**{REPORTED_RESULTS['fraud_rate_real_world']*100:.3f}%** of all transactions are fraud. "
-            "Catching them without upsetting genuine customers is a genuinely hard problem, "
-            "and this system was evaluated on that real, realistic rate — not an inflated one."
+            "This system was evaluated on that realistic rate, not an inflated one."
         )
 
     with right:
         st.subheader("Test-set results (400,000 unseen transactions)")
         fig, ax = plt.subplots(figsize=(4.2, 3.6))
         cm = REPORTED_RESULTS["confusion_matrix"]
-        im = ax.imshow(cm, cmap="Blues")
+        ax.imshow(cm, cmap="Blues")
         labels = ["Legitimate", "Fraud"]
         for i in range(2):
             for j in range(2):
@@ -255,8 +388,8 @@ if page == "Overview":
 elif page == "Try a Transaction":
     st.title("Try It Yourself — Score a Transaction")
     st.markdown(
-        "Fill in a hypothetical transaction below and see how the system would score it. "
-        "The customer's profile fields are pre-filled with a sample profile — feel free to change them too."
+        "Fill in a hypothetical transaction below and see how the system scores it live. "
+        "The cardholder's profile fields are pre-filled — feel free to change them too."
     )
 
     with st.form("transaction_form"):
@@ -273,8 +406,9 @@ elif page == "Try a Transaction":
         with c3:
             location_choice = st.radio(
                 "Merchant location relative to cardholder's home",
-                ["Same city & state (typical)", "Different city, same state",
-                 "Different state (domestic)", "Outside the country"],
+                ["Same city, state & ZIP (typical)", "Same city & state, different ZIP",
+                 "Different city, same state", "Different state (domestic)",
+                 "Outside the country"],
             )
             merchant_known = st.radio("Is this a well-known / frequently-used merchant?", ["Yes", "No"])
             errors = st.multiselect("Any errors reported on this attempt?", ERROR_OPTIONS)
@@ -297,7 +431,7 @@ elif page == "Try a Transaction":
             num_cards = st.number_input("Number of credit cards owned", 1, 10, 3)
             card_brand = st.selectbox("Card brand", ["Visa", "Mastercard", "Amex", "Discover"])
         with p4:
-            card_type = st.selectbox("Card type", ["Debit", "Credit", "Debit (Prepaid)"])
+            card_type = st.selectbox("Card type", ["Credit", "Debit", "Debit (Prepaid)"])
             has_chip = st.selectbox("Card has chip", ["YES", "NO"])
             credit_limit = st.number_input("Credit limit ($)", 0, 200000, 15000, step=500)
             cards_issued = st.number_input("Times this card was reissued", 1, 5, 1)
@@ -305,47 +439,51 @@ elif page == "Try a Transaction":
         submitted = st.form_submit_button("Score this transaction", type="primary")
 
     if submitted:
-        if location_choice == "Same city & state (typical)":
-            same_city, same_state, is_intl = "Yes", "Yes", False
+        if location_choice == "Same city, state & ZIP (typical)":
+            merchant_city, merchant_state, merchant_zip = home_city, home_state, home_zip
+        elif location_choice == "Same city & state, different ZIP":
             merchant_city, merchant_state = home_city, home_state
+            merchant_zip = str(int(home_zip) + 5) if home_zip.isdigit() else "99999"
         elif location_choice == "Different city, same state":
-            same_city, same_state, is_intl = "No", "Yes", False
-            merchant_city, merchant_state = "Nearby Town", home_state
+            merchant_city, merchant_state, merchant_zip = "Nearby Town", home_state, "99999"
         elif location_choice == "Different state (domestic)":
-            same_city, same_state, is_intl = "No", "No", False
             merchant_city = "Other City"
             merchant_state = "TX" if home_state != "TX" else "CA"
-        else:
-            same_city, same_state, is_intl = "No", "No", True
-            merchant_city = "Abroad"
-            merchant_state = FOREIGN_COUNTRIES[0]
+            merchant_zip = "88888"
+        else:  # Outside the country
+            merchant_city, merchant_state, merchant_zip = "Abroad", FOREIGN_COUNTRIES[0], np.nan
 
         inputs = dict(
             amount=amount, use_chip=use_chip, mcc=MCC_CHOICES[mcc_label],
             date=tx_date, time=tx_time, merchant_name=merchant_name,
-            merchant_city=merchant_city, merchant_state=merchant_state,
-            merchant_zip="00000" if is_intl else home_zip,
+            merchant_city=merchant_city, merchant_state=merchant_state, merchant_zip=merchant_zip,
             errors=errors, age=age, retirement_age=retirement_age, gender=gender,
-            home_city=home_city, home_zip=home_zip,
+            home_city=home_city, home_state=home_state, home_zip=home_zip,
             per_capita_income=per_capita_income, yearly_income=yearly_income,
             total_debt=total_debt, fico=fico, num_cards=num_cards,
             card_brand=card_brand, card_type=card_type,
             expires="12/2027", has_chip=has_chip, cards_issued=cards_issued,
             credit_limit=credit_limit, acct_open_date="06/2015", pin_year=2019,
         )
-        inputs["home_state"] = home_state
 
         tx_row = build_transaction_row(inputs)
 
         if MODEL_LOADED:
             probability = float(pipeline.predict_proba(tx_row)[:, 1][0])
+            engineered = pipeline.named_steps["feature_engineering"].transform(tx_row)
+            same_state = int(engineered["same_state"].iloc[0])
+            same_city = int(engineered["same_city"].iloc[0])
+            same_zip = int(engineered["same_zip"].iloc[0])
+            is_intl = int(engineered["is_international"].iloc[0])
         else:
-            probability = demo_mode_score({
-                "_same_state": same_state, "_same_city": same_city,
-                "_is_international": is_intl,
-                "_is_rare_merchant": merchant_known == "No",
-                "Amount": amount, "Errors?": errors,
-            })
+            same_state = int(merchant_state == home_state)
+            same_city = int(merchant_city == home_city)
+            same_zip = int(str(merchant_zip) == str(home_zip))
+            is_intl = int(location_choice == "Outside the country")
+            probability = demo_mode_score(
+                same_state, same_city, same_zip, is_intl,
+                merchant_known == "No", amount, bool(errors),
+            )
 
         is_fraud = probability >= threshold
 
@@ -355,9 +493,9 @@ elif page == "Try a Transaction":
         r1, r2 = st.columns([1, 1.4])
         with r1:
             if is_fraud:
-                st.error(f"### 🚨 Flagged as likely FRAUD\n**Fraud probability: {probability*100:.1f}%**")
+                st.error(f"### 🚨 Flagged as likely FRAUD\n**Fraud probability: {probability*100:.2f}%**")
             else:
-                st.success(f"### ✅ Looks like a legitimate transaction\n**Fraud probability: {probability*100:.1f}%**")
+                st.success(f"### ✅ Looks like a legitimate transaction\n**Fraud probability: {probability*100:.2f}%**")
             st.caption(f"Decision threshold in use: {threshold*100:.1f}%")
 
         with r2:
@@ -373,14 +511,16 @@ elif page == "Try a Transaction":
 
         st.markdown("#### Why the model likely reached this conclusion")
         reasons = []
-        if is_intl:
-            reasons.append("🌍 The transaction took place **outside the cardholder's home country** — historically the single strongest fraud signal in this data.")
-        if same_state == "No":
-            reasons.append("📍 The merchant is in a **different state** from the cardholder's home address.")
-        if same_city == "No" and same_state == "Yes":
+        if same_zip == 0:
+            reasons.append("📮 The merchant's **ZIP code differs** from the cardholder's home ZIP — the single strongest signal for this model.")
+        if same_city == 0:
             reasons.append("🏙️ The merchant is in a **different city** than the cardholder's home city.")
+        if same_state == 0:
+            reasons.append("📍 The merchant is in a **different state** from the cardholder's home address.")
+        if is_intl:
+            reasons.append("🌍 The transaction took place **outside the cardholder's home country**.")
         if merchant_known == "No":
-            reasons.append("🏪 This is a **rarely-used merchant**, which is statistically more associated with fraud.")
+            reasons.append("🏪 This is a **rarely-used merchant**.")
         if amount > 500:
             reasons.append("💵 The transaction amount is **relatively high**.")
         if errors:
@@ -390,6 +530,13 @@ elif page == "Try a Transaction":
         for r in reasons:
             st.markdown(f"- {r}")
 
+        st.caption(
+            "Note: location mismatches (ZIP / city / state) are, for this trained model, "
+            "stronger fraud signals than crossing an international border by itself — "
+            "an international transaction that otherwise looks unremarkable may still "
+            "score as legitimate."
+        )
+
 
 # ====================================================================
 # PAGE 3 — HOW THE MODEL DECIDES
@@ -398,35 +545,43 @@ elif page == "How the Model Decides":
     st.title("How the Model Makes Its Decisions")
     st.markdown(
         "The model looks at dozens of details on every transaction, but a handful of "
-        "patterns matter far more than the rest. These are ranked by how much each one "
-        "actually influenced the model during training."
+        "patterns matter far more than the rest."
     )
 
-    st.subheader("The 7 signals that matter most")
-    for i, (plain_text, _) in enumerate(TOP_FEATURES_STORY, start=1):
-        st.markdown(f"**{i}.** {plain_text}")
+    st.subheader("The signals that matter most, in plain terms")
+    for i, text in enumerate(TOP_FEATURES_STORY, start=1):
+        st.markdown(f"**{i}.** {text}")
 
     st.markdown("---")
     st.subheader("Feature importance (technical view)")
 
+    fi = None
     if MODEL_LOADED:
         try:
             feature_names = pipeline.named_steps["preprocessor"].get_feature_names_out()
             importances = pipeline.named_steps["classifier"].feature_importances_
             fi = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(15)
-        except Exception:
-            fi = None
-    else:
-        fi = None
+        except Exception as e:
+            st.warning(f"Could not read feature importances from the loaded model: {e}")
 
     if fi is None:
-        # Fallback to the reported values from the project report
         fi = pd.Series({
-            "same_state": 0.281, "MCC_4784": 0.056, "same_city": 0.051,
-            "is_rare_merchant": 0.043, "merchant_frequency": 0.028,
-            "same_zip": 0.027, "is_international": 0.023,
+            "same_zip": 0.208, "same_city": 0.172, "same_state": 0.141,
+            "MCC_4784": 0.076, "is_rare_merchant": 0.024, "is_international": 0.016,
         }).sort_values(ascending=False)
         st.caption("Showing previously reported values (no live model loaded).")
+
+    # A ranked table makes the most influential features easy to inspect or export.
+    feature_ranking = (
+        fi.rename_axis("Feature")
+          .reset_index(name="Importance")
+    )
+    feature_ranking.index = feature_ranking.index + 1
+    feature_ranking.index.name = "Rank"
+    st.dataframe(
+        feature_ranking.style.format({"Importance": "{:.2%}"}),
+        use_container_width=True,
+    )
 
     fig, ax = plt.subplots(figsize=(7, 5))
     fi.sort_values().plot(kind="barh", ax=ax, color="#1f5fa8")
@@ -447,12 +602,14 @@ before treating it as production-ready:
 
 - **Training data is synthetic.** It was generated by a simulation, not collected from
   real banking incidents. Real-world performance must be re-validated on real transaction data.
-- **The train/validation/test split was random, not time-based.** For a production deployment,
-  the model should be re-tested using a strict "train on the past, test on the future" split,
-  which better reflects how the system will actually be used.
-- **It will still make mistakes.** About 37 out of every 100 real fraud cases may go
+- **The train/validation/test split was random, not time-based.** For production, the model
+  should be re-tested using a strict "train on the past, test on the future" split.
+- **It will still make mistakes.** Roughly 37 out of every 100 real fraud cases may go
   undetected, and a small number of genuine customers will occasionally be flagged
   by mistake. This system is meant to prioritize human review, not fully replace it.
+- **Location-mismatch signals dominate this model.** An international transaction that
+  otherwise matches the cardholder's normal spending pattern may not be flagged — this
+  reflects the specific training sample and should be re-validated on more diverse data.
 - **It should be periodically retested.** Fraud patterns change over time; a model
   trained today should be monitored and refreshed as new data becomes available.
         """
